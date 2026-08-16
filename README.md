@@ -1,6 +1,6 @@
 # Smart Traffic Management System
 
-Real-time vehicle detection and traffic monitoring system built with YOLOv8 and OpenCV. Detects and tracks cars, trucks, buses, and motorcycles from live camera or video feeds, serves live counts through a FastAPI backend, and displays them on a Streamlit dashboard. Designed to run on Raspberry Pi. Built for Smart India Hackathon (SIH).
+Real-time vehicle detection and traffic monitoring system built with YOLOv8 and OpenCV. Detects and tracks cars, trucks, buses, and motorcycles from live camera or video feeds, serves live counts through a FastAPI backend, and displays them on a Streamlit dashboard. Designed to run on Raspberry Pi. 
 
 ## Features
 
