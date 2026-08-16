@@ -118,3 +118,4 @@ while True:
                 st.info("Collecting trend data... check back in a few seconds.")
 
     time.sleep(REFRESH_SECONDS)
+    
