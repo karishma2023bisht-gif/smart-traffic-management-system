@@ -1,6 +1,6 @@
 """
 Live dashboard — polls the FastAPI backend and displays vehicle counts,
-congestion level, per-lane density, signal recommendations, and a trend chart.
+congestion level, per-lane density, emergency vehicle alerts, and a trend chart.
 
 Run with:
     streamlit run dashboard/app.py
@@ -34,15 +34,23 @@ while True:
         if data is None:
             st.error("Could not reach the API. Is it running on localhost:8000?")
         else:
+            emergency_vehicles = data.get("emergency_vehicles", [])
+
+            # Emergency alert takes priority over everything else
+            if emergency_vehicles:
+                ev = emergency_vehicles[0]
+                st.error(f"🚨 EMERGENCY VEHICLE DETECTED — {ev['type'].upper()} in {ev['lane'].replace('_', ' ').title()} — SIGNAL OVERRIDE ACTIVE 🚨")
+
             level = data.get("congestion_level", "Low")
             emoji = CONGESTION_COLORS.get(level, "🟢")
 
-            if level == "High":
-                st.error(f"{emoji} HIGH CONGESTION — {data.get('total_vehicles_now', 0)} vehicles in frame")
-            elif level == "Medium":
-                st.warning(f"{emoji} Moderate traffic — {data.get('total_vehicles_now', 0)} vehicles in frame")
-            else:
-                st.success(f"{emoji} Traffic flowing normally — {data.get('total_vehicles_now', 0)} vehicles in frame")
+            if not emergency_vehicles:
+                if level == "High":
+                    st.error(f"{emoji} HIGH CONGESTION — {data.get('total_vehicles_now', 0)} vehicles in frame")
+                elif level == "Medium":
+                    st.warning(f"{emoji} Moderate traffic — {data.get('total_vehicles_now', 0)} vehicles in frame")
+                else:
+                    st.success(f"{emoji} Traffic flowing normally — {data.get('total_vehicles_now', 0)} vehicles in frame")
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Vehicles now", data.get("total_vehicles_now", 0))
@@ -59,7 +67,10 @@ while True:
             recommendation = data.get("signal_recommendation", {})
             priority_lane = recommendation.get("priority_lane")
             if priority_lane:
-                st.info(f"**Priority lane: {priority_lane}** — {recommendation.get('reason', '')}")
+                if recommendation.get("emergency_override"):
+                    st.error(f"**🚨 {recommendation.get('reason', '')}**")
+                else:
+                    st.info(f"**Priority lane: {priority_lane}** — {recommendation.get('reason', '')}")
                 green_times = recommendation.get("green_time_seconds", {})
                 cols = st.columns(len(green_times)) if green_times else []
                 for col, (lane, seconds) in zip(cols, green_times.items()):

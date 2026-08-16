@@ -1,7 +1,7 @@
 """
 API layer — runs the detector in a background thread, classifies congestion
-level per lane, recommends signal priority for the busiest lane, keeps a
-rolling history for trend charts, and exposes it all over HTTP.
+level per lane, recommends signal priority (with emergency vehicle override),
+keeps a rolling history for trend charts, and exposes it all over HTTP.
 
 Run with:
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -48,18 +48,27 @@ def classify_congestion(vehicle_count: int) -> str:
         return "High"
 
 
-def recommend_signal_priority(counts_by_lane: dict) -> dict:
+def recommend_signal_priority(counts_by_lane: dict, emergency_vehicles: list) -> dict:
     """
-    Simple rule: the lane with the most vehicles gets recommended extra
-    green time, proportional to its share of total traffic across lanes.
+    If an emergency vehicle is detected in any lane, that lane gets
+    IMMEDIATE full priority, overriding normal density-based timing.
+    Otherwise, green time is distributed proportionally to lane density.
     """
+    if emergency_vehicles:
+        emergency_lane = emergency_vehicles[0]["lane"]
+        emergency_type = emergency_vehicles[0]["type"]
+        return {
+            "priority_lane": emergency_lane,
+            "reason": f"EMERGENCY OVERRIDE: {emergency_type} detected in {emergency_lane}",
+            "emergency_override": True,
+            "green_time_seconds": {emergency_lane: 90},  # full cycle to this lane
+        }
+
     total = sum(counts_by_lane.values())
     if total == 0:
-        return {"priority_lane": None, "reason": "No traffic detected", "green_time_seconds": {}}
+        return {"priority_lane": None, "reason": "No traffic detected", "emergency_override": False, "green_time_seconds": {}}
 
     busiest_lane = max(counts_by_lane, key=counts_by_lane.get)
-
-    # Distribute a 90-second signal cycle proportionally to each lane's share
     cycle_seconds = 90
     green_time_seconds = {
         lane: round((count / total) * cycle_seconds)
@@ -69,6 +78,7 @@ def recommend_signal_priority(counts_by_lane: dict) -> dict:
     return {
         "priority_lane": busiest_lane,
         "reason": f"{busiest_lane} has the highest vehicle count ({counts_by_lane[busiest_lane]})",
+        "emergency_override": False,
         "green_time_seconds": green_time_seconds,
     }
 
@@ -114,7 +124,10 @@ def live_count():
         stats = detector.get_stats()
 
     stats["congestion_level"] = classify_congestion(stats["total_vehicles_now"])
-    stats["signal_recommendation"] = recommend_signal_priority(stats.get("counts_by_lane", {}))
+    stats["signal_recommendation"] = recommend_signal_priority(
+        stats.get("counts_by_lane", {}),
+        stats.get("emergency_vehicles", []),
+    )
     return stats
 
 
