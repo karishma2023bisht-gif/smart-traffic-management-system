@@ -1,7 +1,8 @@
 """
-API layer — runs the detector in a background thread, classifies congestion
-level per lane, recommends signal priority (with emergency vehicle override),
-keeps a rolling history for trend charts, and exposes it all over HTTP.
+API layer — runs the detector in a background thread, and runs a SEPARATE
+signal-cycling thread that gives each lane a real turn at green, with
+duration proportional to that lane's traffic density. Emergency vehicles
+immediately hijack the signal regardless of the current cycle.
 
 Run with:
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -34,9 +35,22 @@ VIDEO_SOURCE = "sample_videos/trafficsample1.mp4"  # change to 0 for webcam
 LOW_THRESHOLD = 5
 HIGH_THRESHOLD = 12
 
+MIN_GREEN_SECONDS = 8       # every lane gets AT LEAST this much green time, even if empty
+CYCLE_TOTAL_SECONDS = 60    # total time distributed across all lanes per full rotation
+EMERGENCY_GREEN_SECONDS = 15  # how long an emergency vehicle holds the green
+
 detector = TrafficDetector()
 _lock = threading.Lock()
 history = deque(maxlen=120)
+
+signal_state = {
+    "current_lane": None,
+    "time_remaining": 0,
+    "lane_order": [],
+    "green_durations": {},
+    "emergency_active": False,
+}
+_signal_lock = threading.Lock()
 
 
 def classify_congestion(vehicle_count: int) -> str:
@@ -48,42 +62,23 @@ def classify_congestion(vehicle_count: int) -> str:
         return "High"
 
 
-def recommend_signal_priority(counts_by_lane: dict, emergency_vehicles: list) -> dict:
-    """
-    If an emergency vehicle is detected in any lane, that lane gets
-    IMMEDIATE full priority, overriding normal density-based timing.
-    Otherwise, green time is distributed proportionally to lane density.
-    """
-    if emergency_vehicles:
-        emergency_lane = emergency_vehicles[0]["lane"]
-        emergency_type = emergency_vehicles[0]["type"]
-        return {
-            "priority_lane": emergency_lane,
-            "reason": f"EMERGENCY OVERRIDE: {emergency_type} detected in {emergency_lane}",
-            "emergency_override": True,
-            "green_time_seconds": {emergency_lane: 90},  # full cycle to this lane
-        }
-
+def compute_green_durations(counts_by_lane: dict) -> dict:
+    """Busier lanes get more seconds; every lane gets at least MIN_GREEN_SECONDS."""
+    lanes = list(counts_by_lane.keys())
+    if not lanes:
+        return {}
     total = sum(counts_by_lane.values())
     if total == 0:
-        return {"priority_lane": None, "reason": "No traffic detected", "emergency_override": False, "green_time_seconds": {}}
-
-    busiest_lane = max(counts_by_lane, key=counts_by_lane.get)
-    cycle_seconds = 90
-    green_time_seconds = {
-        lane: round((count / total) * cycle_seconds)
-        for lane, count in counts_by_lane.items()
-    }
-
+        equal_share = CYCLE_TOTAL_SECONDS // len(lanes)
+        return {lane: max(MIN_GREEN_SECONDS, equal_share) for lane in lanes}
     return {
-        "priority_lane": busiest_lane,
-        "reason": f"{busiest_lane} has the highest vehicle count ({counts_by_lane[busiest_lane]})",
-        "emergency_override": False,
-        "green_time_seconds": green_time_seconds,
+        lane: max(MIN_GREEN_SECONDS, round((count / total) * CYCLE_TOTAL_SECONDS))
+        for lane, count in counts_by_lane.items()
     }
 
 
 def camera_loop():
+    """Continuously reads frames and updates detector stats."""
     cap = cv2.VideoCapture(VIDEO_SOURCE)
     last_logged = 0
 
@@ -107,10 +102,58 @@ def camera_loop():
             last_logged = now
 
 
+def signal_loop():
+    """
+    Runs independently, once per second, giving each lane a real turn at
+    green light, proportional to its density. Emergency vehicles interrupt
+    the cycle immediately and hold the green until they've passed.
+    """
+    while True:
+        time.sleep(1)
+
+        with _lock:
+            stats = detector.get_stats()
+        counts_by_lane = stats.get("counts_by_lane", {})
+        emergency_vehicles = stats.get("emergency_vehicles", [])
+
+        if not counts_by_lane:
+            continue
+
+        with _signal_lock:
+            # First run: set up the initial rotation
+            if not signal_state["lane_order"]:
+                signal_state["lane_order"] = list(counts_by_lane.keys())
+                signal_state["green_durations"] = compute_green_durations(counts_by_lane)
+                signal_state["current_lane"] = signal_state["lane_order"][0]
+                signal_state["time_remaining"] = signal_state["green_durations"][signal_state["current_lane"]]
+
+            # Emergency vehicle: interrupt immediately, hold green for it
+            if emergency_vehicles:
+                emergency_lane = emergency_vehicles[0]["lane"]
+                if not signal_state["emergency_active"] or signal_state["current_lane"] != emergency_lane:
+                    signal_state["current_lane"] = emergency_lane
+                    signal_state["time_remaining"] = EMERGENCY_GREEN_SECONDS
+                    signal_state["emergency_active"] = True
+                else:
+                    signal_state["time_remaining"] -= 1
+                continue
+            else:
+                signal_state["emergency_active"] = False
+
+            # Normal rotation: count down, then move to the next lane in order
+            signal_state["time_remaining"] -= 1
+            if signal_state["time_remaining"] <= 0:
+                current_index = signal_state["lane_order"].index(signal_state["current_lane"])
+                next_index = (current_index + 1) % len(signal_state["lane_order"])
+                signal_state["current_lane"] = signal_state["lane_order"][next_index]
+                signal_state["green_durations"] = compute_green_durations(counts_by_lane)
+                signal_state["time_remaining"] = signal_state["green_durations"][signal_state["current_lane"]]
+
+
 @app.on_event("startup")
-def start_background_capture():
-    thread = threading.Thread(target=camera_loop, daemon=True)
-    thread.start()
+def start_background_threads():
+    threading.Thread(target=camera_loop, daemon=True).start()
+    threading.Thread(target=signal_loop, daemon=True).start()
 
 
 @app.get("/")
@@ -122,12 +165,11 @@ def root():
 def live_count():
     with _lock:
         stats = detector.get_stats()
-
     stats["congestion_level"] = classify_congestion(stats["total_vehicles_now"])
-    stats["signal_recommendation"] = recommend_signal_priority(
-        stats.get("counts_by_lane", {}),
-        stats.get("emergency_vehicles", []),
-    )
+
+    with _signal_lock:
+        stats["signal_state"] = dict(signal_state)
+
     return stats
 
 
